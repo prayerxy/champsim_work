@@ -1,0 +1,142 @@
+#include "cache.h"
+#define IT_SIZE 256
+#define GHB_SIZE 256
+#define PREFETCH_DEGREE 10
+#define LOOK_AHEAD 4
+/*
+GHB_stride
+这里推荐实现的是基于 GHB 的步长预取算法。
+你的目标是通过函数在 L2 缓存上实现一个基于全局历史缓冲区(Global
+History Buffer)的步长预取器。 预取器记录 L1 数据缓存中丢失的负载的地址的
+访问模式，并将预测的数据预取到 L2 缓存中。它由两个主要结构组成：
+•索引表(Index Table，IT)：一个通过程序属性(例如程序计数器 PC)进行索引
+的表，它存储指向 GHB 条目的指针。
+•全局历史缓冲区(GHB)：一个循环队列，存储 L2 缓存观察到的cacheline地址
+序列。每个 GHB 条目存储一个指针(这里称为 prev_ptr)，该指针指向具有相同 IT
+索引的最后一个cacheline地址。通过遍历 prev_ptr，可以获得指向同一 IT 条目的缓
+存行地址的时间序列。
+算法过程：对于每个二级缓存访问(命中和未命中)，该算法使用访问的 PC 索
+引到 IT 中，并将cacheline地址(例如 A)插入 GHB。该算法使用 PC 和 GHB 条目中
+的链接指针，检索访问二级缓存对应条目中的最后 3 个地址。步长是通过取序列
+中 3 个连续地址之间的差来计算的。如果两个步长相等(步长为 d)，预取器只向
+cacheline A+ld、A+(l+1)d、A+(l+2)d、…、A+(l+n)d 发出预取请求，其中 l 是事先
+设定好的预取 look-ahead，n 是度。对于你的设计，你可以将 l 和 n 静态设置。
+还请调整 IT 和 GHB 的大小，使其为 256 个条目。
+*/
+
+class GHB_Entry{
+  public:
+  uint8_t IT_index;
+  uint64_t cl_addr;
+  GHB_Entry* prev_ptr;
+  int64_t last_stride;//这个条目与上一个IT相同项的地址stride
+  uint64_t reliable;
+  GHB_Entry(){
+    IT_index=0;
+    cl_addr=0;
+    prev_ptr=0;
+    last_stride=0;
+    reliable=0;
+  }
+};//FIFO表
+
+//根据PC后8位索引，指向GHB_Entry
+class IT_Entry{
+  public:
+    GHB_Entry* ghb_ptr;
+    IT_Entry(){
+      ghb_ptr=0;
+    }
+};
+
+IT_Entry IT[IT_SIZE];
+GHB_Entry GHB[GHB_SIZE];
+int GHB_index=0;
+
+GHB_Entry* find_same_itIndex(uint8_t index){
+  int pre=GHB_index-1;
+  if(pre==-1)pre=GHB_SIZE-1;
+  for(int i=0;i<GHB_SIZE;i++){
+    if(index==GHB[pre].IT_index)
+      return &GHB[pre];
+    pre--;
+    if(pre==-1)pre=GHB_SIZE-1;
+  }
+  return 0;
+}
+
+GHB_Entry* GHB_insert(uint8_t index,uint64_t cl_addr){
+    GHB_Entry* entry;
+    entry=&GHB[GHB_index];
+    entry->IT_index=index;
+    entry->cl_addr=cl_addr;
+    entry->prev_ptr=find_same_itIndex(index);
+
+    uint64_t last_cl_addr=entry->prev_ptr->cl_addr;
+    if (cl_addr > last_cl_addr)
+        entry->last_stride = cl_addr - last_cl_addr;
+    else {
+        entry->last_stride = last_cl_addr - cl_addr;
+        entry->last_stride *= -1;
+    }
+
+    // 更新 reliable stride count
+    if (entry->last_stride == entry->prev_ptr->last_stride) {
+        entry->reliable = entry->prev_ptr->reliable + 1;
+    } else {
+        entry->reliable = 0; // Reset reliable count if strides are different
+    }
+    GHB_index++;
+    GHB_index=GHB_index%GHB_SIZE;//实现循环插入
+    return entry;
+}
+
+void CACHE::llc_prefetcher_initialize() 
+{
+  cout <<" LLC GHB_Stride prefetcher" << endl;
+}
+
+//called on every cache access
+uint32_t CACHE::llc_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+  uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;//cacheline address
+  uint8_t IT_index=(uint8_t)(ip & 0xff);
+  IT[IT_index].ghb_ptr=GHB_insert(IT_index,cl_addr);
+
+  GHB_Entry* entry;
+  entry=IT[IT_index].ghb_ptr;
+
+ 
+  int64_t stride1 = entry->last_stride;
+  int64_t stride2 = entry->prev_ptr->last_stride;
+
+  if (stride1==0)
+    return metadata_in;
+
+  if(stride1==stride2){
+    // do some prefetching
+    //把reliable传送给预取的程序
+    for (int i=0; i<PREFETCH_DEGREE; i++) {
+      uint64_t pf_address = (cl_addr + (stride1*(i+1))) << LOG2_BLOCK_SIZE;
+
+      // only issue a prefetch if the prefetch address is in the same 4 KB page 
+      // as the current demand access address
+      if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+        break;
+
+      // 最后一级预取
+	    prefetch_line(ip, addr, pf_address, FILL_LLC, 0,entry->reliable);
+    }
+  }
+  return metadata_in;
+}
+
+uint32_t CACHE::llc_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+void CACHE::llc_prefetcher_final_stats()
+{
+
+}

@@ -1,0 +1,113 @@
+#include "cache.h"
+#define IT_SIZE 256
+#define GHB_SIZE 256
+#define PREFETCH_DEGREE 10
+#define LOOK_AHEAD 4
+
+class GHB_Entry2{
+  public:
+  uint8_t IT_index;
+  uint64_t cl_addr;
+  GHB_Entry2* prev_ptr;
+  int64_t last_stride;//这个条目与上一个IT相同项的地址stride
+  GHB_Entry2(){
+    IT_index=0;
+    cl_addr=0;
+    prev_ptr=0;
+    last_stride=0;
+  }
+};//FIFO表
+
+//根据PC后8位索引，指向GHB_Entry2
+class IT_Entry2{
+  public:
+    GHB_Entry2* ghb_ptr;
+    IT_Entry2(){
+      ghb_ptr=0;
+    }
+};
+
+IT_Entry2 IT2[IT_SIZE];
+GHB_Entry2 GHB2[GHB_SIZE];
+int GHB_index2=0;
+
+GHB_Entry2* find_same_itIndex2(uint8_t index){
+  int pre=GHB_index2-1;
+  if(pre==-1)pre=GHB_SIZE-1;
+  for(int i=0;i<GHB_SIZE;i++){
+    if(index==GHB2[pre].IT_index)
+      return &GHB2[pre];
+    pre--;
+    if(pre==-1)pre=GHB_SIZE-1;
+  }
+  return 0;
+}
+
+GHB_Entry2* GHB_insert2(uint8_t index,uint64_t cl_addr){
+    GHB_Entry2* entry;
+    entry=&GHB2[GHB_index2];
+    entry->IT_index=index;
+    entry->cl_addr=cl_addr;
+    entry->prev_ptr=find_same_itIndex2(index);
+
+    uint64_t last_cl_addr=entry->prev_ptr->cl_addr;
+    if (cl_addr > last_cl_addr)
+        entry->last_stride = cl_addr - last_cl_addr;
+    else {
+        entry->last_stride = last_cl_addr - cl_addr;
+        entry->last_stride *= -1;
+    }
+    GHB_index2++;
+    GHB_index2=GHB_index2%GHB_SIZE;//实现循环插入
+    return entry;
+}
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+  cout <<" LLC GHB_Stride prefetcher" << endl;
+}
+
+//called on every cache access
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+  uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;//cacheline address
+  uint8_t IT_index=(uint8_t)(ip & 0xff);
+  IT2[IT_index].ghb_ptr=GHB_insert2(IT_index,cl_addr);
+
+  GHB_Entry2* entry;
+  entry=IT2[IT_index].ghb_ptr;
+
+ 
+  int64_t stride1 = entry->last_stride;
+  int64_t stride2 = entry->prev_ptr->last_stride;
+  
+  if (stride1==0)
+    return metadata_in;
+
+  if(stride1==stride2){
+    // do some prefetching
+    for (int i=0; i<PREFETCH_DEGREE; i++) {
+      uint64_t pf_address = (cl_addr + (stride1*(i+1))) << LOG2_BLOCK_SIZE;
+
+      // only issue a prefetch if the prefetch address is in the same 4 KB page 
+      // as the current demand access address
+      if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+        break;
+      // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+      if (MSHR.occupancy < (MSHR.SIZE>>1))
+	    prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+        else
+	    prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+    }
+  }
+  return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C PC-based stride prefetcher final stats" << endl;
+}
